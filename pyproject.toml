@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vocabsynth"
+version = "0.1.0"
+description = "Training-free Static Vocabulary Synthesis"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "transformers",
+    "numpy",
+]
+
+[project.optional-dependencies]
+docs = [
+    "sphinx",
+    "sphinx-autodoc-typehints",
+    "furo",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vocabsynth"]
