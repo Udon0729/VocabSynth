@@ -18,6 +18,13 @@ class RelationType(Enum):
     PLACE_INSTITUTION = "place+institution"
     MATERIAL_ARTIFACT = "material+artifact"
     PURPOSE_CONTAINER = "purpose+container"
+    # 3語以上の合成向け
+    PLACE_MATERIAL_ARTIFACT = "place+material+artifact"
+    PLACE_FOOD_STYLE = "place+food+style"
+    PLACE_STRUCTURE_FEATURE = "place+structure+feature"
+    # 接辞による派生語向け
+    PREFIX_DERIVED = "prefix+derived"
+    SUFFIX_DERIVED = "suffix+derived"
 
 
 @dataclass

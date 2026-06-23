@@ -1,12 +1,20 @@
-"""不均衡最適輸送に基づく出力重み合成。
+"""最適輸送に基づく出力重み合成。
 
 非 weight tying モデルにおいて、入力埋め込み空間 E と
-出力重み空間 W の幾何学的対応を局所的な不均衡最適輸送
-（UOT）で推定し、仮想トークンの出力重みを合成する。
+出力重み空間 W の幾何学的対応を局所的な最適輸送で推定し、
+仮想トークンの出力重みを合成する。
 
-従来手法（W の構成トークン行を直接平均する）では E→W 間の
-非自明な幾何構造が無視される。UOT の重心射影を用いることで、
-構成トークン近傍の E→W 対応関係を反映した出力重みが得られる。
+二つの方式を提供する。
+
+**交差空間 OT（均衡 / 不均衡）**:
+  E 点と W 点の間のユークリッド距離をコストとして
+  Sinkhorn ソルバで輸送計画を解く。
+  二空間が整列していない場合、コスト行列の情報量が低下する。
+
+**Gromov-Wasserstein（GW / 半緩和 GW / 部分 GW）**:
+  各空間内の距離構造 C_E, C_W を比較し、構造的対応を求める。
+  二空間の絶対的な配置が無関係でも、内部の相対的な幾何が
+  類似していれば有効に機能する。
 """
 
 from __future__ import annotations
@@ -25,24 +33,29 @@ class OTMethod(Enum):
 
     BALANCED = "balanced"
     UNBALANCED = "unbalanced"
+    GW = "gw"
+    SEMIRELAXED_GW = "srgw"
+    PARTIAL_GW = "pgw"
 
 
 class OTOutputComposer:
-    """UOT 重心射影による出力重み合成器。
+    """最適輸送の重心射影による出力重み合成器。
 
-    構成トークンごとに E 空間の k 近傍を取得し、同一トークン群の
-    W 空間上の配置との間で局所的な UOT 計画を解く。
-    得られた輸送計画の重心射影で各構成トークンの出力重みを求め、
-    それらを入力側と同じ重みで合成する。
+    構成トークンごとに E 空間の k 近傍を取得し、局所的な
+    輸送計画を解いて W 空間への重心射影で出力重みを求める。
+
+    交差空間 OT（``BALANCED``, ``UNBALANCED``）は E-W 間の
+    ユークリッド距離をコストに使い、Gromov-Wasserstein 系
+    （``GW``, ``SEMIRELAXED_GW``, ``PARTIAL_GW``）は各空間
+    内部の距離構造を比較する。
 
     Args:
         input_embeddings: 入力埋め込み行列 E (形状: ``[V, d]``)。
         output_weights: 出力重み行列 W (形状: ``[V, d]``)。
         k_neighbors: 近傍トークン数。
-        epsilon: エントロピー正則化係数。小さいほど決定的な輸送になる。
-        tau: 周辺制約の KL ペナルティ係数。
-            小さいほど不均衡性を許容し、大きいほど均衡に近づく。
-            :attr:`OTMethod.BALANCED` では無視される。
+        epsilon: エントロピー正則化係数。
+        tau: UOT の周辺制約 KL ペナルティ。
+        partial_mass: 部分 GW で輸送する質量の割合 (0, 1]。
     """
 
     def __init__(
@@ -52,17 +65,19 @@ class OTOutputComposer:
         k_neighbors: int = 200,
         epsilon: float = 0.05,
         tau: float = 1.0,
+        partial_mass: float = 0.5,
     ) -> None:
         self._E = input_embeddings.detach().float()
         self._W = output_weights.detach().float()
         self._k = k_neighbors
         self._eps = epsilon
         self._tau = tau
+        self._partial_mass = partial_mass
         self._V, self._d = self._E.shape
 
         self._E_norm = torch.nn.functional.normalize(self._E, dim=1)
 
-        self._bary_cache: dict[tuple[int, str, float], torch.Tensor] = {}
+        self._bary_cache: dict[tuple, torch.Tensor] = {}
 
     def compose(
         self,
@@ -133,53 +148,30 @@ class OTOutputComposer:
     def _barycentric_projection(
         self, token_id: int, ot_method: OTMethod
     ) -> torch.Tensor:
-        """トークンの UOT 重心射影を計算する。
+        """トークンの重心射影を計算する。
 
-        1. E 空間で k 近傍を探索する。
-        2. 近傍トークン群の E 行と W 行の間で局所 OT を解く。
-        3. 対象トークン行の輸送計画から W 空間への重心射影を返す。
+        交差空間 OT は E-W 間距離をコストに使い、GW 系は
+        各空間内の距離行列 C_E, C_W の構造的対応を求める。
         """
-        cache_key = (token_id, ot_method.value, self._tau)
+        cache_key = (
+            token_id, ot_method.value, self._tau, self._partial_mass,
+        )
         if cache_key in self._bary_cache:
             return self._bary_cache[cache_key]
 
         neighbor_ids = self._find_neighbors(token_id)
-
         E_local = self._E[neighbor_ids]
         W_local = self._W[neighbor_ids]
-
-        C = torch.cdist(E_local, W_local).pow(2)
-        C_np = C.cpu().numpy().astype(np.float64)
-
-        C_median = np.median(C_np[C_np > 0])
-        if C_median > 0:
-            C_normalized = C_np / C_median
-        else:
-            C_normalized = C_np
-
         k = len(neighbor_ids)
-        a = np.ones(k, dtype=np.float64) / k
-        b = np.ones(k, dtype=np.float64) / k
 
-        if ot_method == OTMethod.BALANCED:
-            pi = pot.bregman.sinkhorn(
-                a, b, C_normalized,
-                reg=self._eps,
-                numItermax=1000,
-                warn=False,
-            )
+        if ot_method in (OTMethod.BALANCED, OTMethod.UNBALANCED):
+            pi = self._solve_cross_space(E_local, W_local, k, ot_method)
         else:
-            pi = pot.unbalanced.sinkhorn_unbalanced(
-                a, b, C_normalized,
-                reg=self._eps,
-                reg_m=self._tau,
-                numItermax=1000,
-                warn=False,
+            pi = self._solve_gromov_wasserstein(
+                E_local, W_local, k, ot_method,
             )
 
-        query_mask = (neighbor_ids == token_id)
-        query_pos = query_mask.nonzero(as_tuple=True)[0].item()
-
+        query_pos = (neighbor_ids == token_id).nonzero(as_tuple=True)[0].item()
         row = pi[query_pos]
         row_sum = row.sum()
 
@@ -195,6 +187,92 @@ class OTOutputComposer:
 
         self._bary_cache[cache_key] = result
         return result
+
+    def _solve_cross_space(
+        self,
+        E_local: torch.Tensor,
+        W_local: torch.Tensor,
+        k: int,
+        ot_method: OTMethod,
+    ) -> np.ndarray:
+        """E-W 間ユークリッド距離をコストとする交差空間 OT。"""
+        C = torch.cdist(E_local, W_local).pow(2)
+        C_np = C.cpu().numpy().astype(np.float64)
+
+        C_median = np.median(C_np[C_np > 0])
+        if C_median > 0:
+            C_np = C_np / C_median
+
+        a = np.ones(k, dtype=np.float64) / k
+        b = np.ones(k, dtype=np.float64) / k
+
+        if ot_method == OTMethod.BALANCED:
+            return pot.bregman.sinkhorn(
+                a, b, C_np,
+                reg=self._eps,
+                numItermax=1000,
+                warn=False,
+            )
+        return pot.unbalanced.sinkhorn_unbalanced(
+            a, b, C_np,
+            reg=self._eps,
+            reg_m=self._tau,
+            numItermax=1000,
+            warn=False,
+        )
+
+    def _solve_gromov_wasserstein(
+        self,
+        E_local: torch.Tensor,
+        W_local: torch.Tensor,
+        k: int,
+        ot_method: OTMethod,
+    ) -> np.ndarray:
+        """各空間内の距離構造を比較する Gromov-Wasserstein。"""
+        C_E = torch.cdist(E_local, E_local).pow(2)
+        C_W = torch.cdist(W_local, W_local).pow(2)
+
+        C_E_np = C_E.cpu().numpy().astype(np.float64)
+        C_W_np = C_W.cpu().numpy().astype(np.float64)
+
+        C_E_med = np.median(C_E_np[C_E_np > 0])
+        C_W_med = np.median(C_W_np[C_W_np > 0])
+        if C_E_med > 0:
+            C_E_np = C_E_np / C_E_med
+        if C_W_med > 0:
+            C_W_np = C_W_np / C_W_med
+
+        p = np.ones(k, dtype=np.float64) / k
+        q = np.ones(k, dtype=np.float64) / k
+
+        if ot_method == OTMethod.GW:
+            return pot.gromov.entropic_gromov_wasserstein(
+                C_E_np, C_W_np, p, q,
+                loss_fun="square_loss",
+                epsilon=self._eps,
+                max_iter=1000,
+                verbose=False,
+                log=False,
+            )
+        if ot_method == OTMethod.SEMIRELAXED_GW:
+            return pot.gromov.entropic_semirelaxed_gromov_wasserstein(
+                C_E_np, C_W_np, p,
+                loss_fun="square_loss",
+                epsilon=self._eps,
+                max_iter=1000,
+                verbose=False,
+                log=False,
+            )
+        m = self._partial_mass * min(p.sum(), q.sum())
+        return pot.gromov.entropic_partial_gromov_wasserstein(
+            C_E_np, C_W_np, p, q,
+            reg=self._eps,
+            m=m,
+            loss_fun="square_loss",
+            numItermax=1000,
+            verbose=False,
+            log=False,
+        )
 
     def _find_neighbors(self, token_id: int) -> torch.Tensor:
         """E 空間での k 近傍トークンIDを返す。"""
@@ -237,32 +315,56 @@ class OTOutputComposer:
     ) -> dict:
         """構成トークン近傍の E→W 対応関係を診断する。
 
+        交差空間（E-W 直接比較）と各空間内部の距離構造の両方を報告する。
+        GW が有効かどうかの事前判断に使える。
+
         Args:
             token_id: 対象トークンID。
 
         Returns:
-            近傍の E-W 整合度、ノルム分布などの診断情報。
+            近傍の幾何情報を含む辞書。
         """
         neighbor_ids = self._find_neighbors(token_id)
         E_local = self._E[neighbor_ids]
         W_local = self._W[neighbor_ids]
+        k = len(neighbor_ids)
 
         paired_cos = torch.nn.functional.cosine_similarity(
             E_local, W_local, dim=1
         )
 
-        C = torch.cdist(E_local, W_local).pow(2)
-        diag_costs = C.diag()
-        off_diag_mask = ~torch.eye(len(neighbor_ids), dtype=torch.bool)
-        off_diag_costs = C[off_diag_mask]
+        C_cross = torch.cdist(E_local, W_local).pow(2)
+        diag_costs = C_cross.diag()
+        off_diag_mask = ~torch.eye(k, dtype=torch.bool)
+        off_diag_costs = C_cross[off_diag_mask]
+
+        C_E = torch.cdist(E_local, E_local).pow(2)
+        C_W = torch.cdist(W_local, W_local).pow(2)
+        C_E_flat = C_E[off_diag_mask]
+        C_W_flat = C_W[off_diag_mask]
+
+        rank_corr = _spearman_corr(C_E_flat, C_W_flat)
 
         return {
             "token_id": token_id,
-            "k": len(neighbor_ids),
+            "k": k,
             "paired_cosine_mean": paired_cos.mean().item(),
             "paired_cosine_std": paired_cos.std().item(),
             "diagonal_cost_mean": diag_costs.mean().item(),
             "off_diagonal_cost_mean": off_diag_costs.mean().item(),
             "E_norm_mean": E_local.norm(dim=1).mean().item(),
             "W_norm_mean": W_local.norm(dim=1).mean().item(),
+            "intra_distance_rank_corr": rank_corr,
         }
+
+
+def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    """二つのベクトルの Spearman 順位相関を計算する。"""
+    rx = x.argsort().argsort().float()
+    ry = y.argsort().argsort().float()
+    rx = rx - rx.mean()
+    ry = ry - ry.mean()
+    denom = rx.norm() * ry.norm()
+    if denom < 1e-12:
+        return 0.0
+    return (rx @ ry / denom).item()

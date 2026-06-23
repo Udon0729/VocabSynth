@@ -15,7 +15,12 @@ checkpoints/
 *.safetensors
 
 results/
+logs/
 
 .env
 *.log
 nohup.out
+
+.DS_Store
+*.swp
+*~
